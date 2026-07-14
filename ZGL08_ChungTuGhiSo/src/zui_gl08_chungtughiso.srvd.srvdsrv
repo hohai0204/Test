@@ -1,0 +1,4 @@
+@EndUserText.label: 'ZGL08 - Chung tu ghi so - Service Definition'
+define service ZUI_GL08_CHUNGTUGHISO {
+  expose ZC_GL08_CHUNGTUGHISO as ChungTuGhiSo;
+}

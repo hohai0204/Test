@@ -1,0 +1,197 @@
+@Metadata.layer: #CORE
+@UI: {
+  headerInfo: {
+    typeName: 'Chung tu ghi so',
+    typeNamePlural: 'Chung tu ghi so',
+    title: { type: #STANDARD, value: 'journal_entry' }
+  },
+  presentationVariant: [{
+    sortOrder: [
+      { by: 'journal_entry', direction: #ASC },
+      { by: 'debit_journal_entry_item', direction: #ASC },
+      { by: 'credit_journal_entry_item', direction: #ASC }
+    ]
+  }]
+}
+annotate entity ZC_GL08_CHUNGTUGHISO with
+{
+  // ------------------------------------------------------------------
+  // Selection / filter bar (FS section 2.2.2). Company Code and Posting
+  // Date are marked mandatory per the FS's "Bat buoc = Co" column.
+  // ------------------------------------------------------------------
+  @UI.selectionField: [{ position: 10 }]
+  @Consumption.filter: { mandatory: true }
+  company_code;
+
+  @UI.selectionField: [{ position: 20 }]
+  gl_account;
+
+  @UI.selectionField: [{ position: 30 }]
+  @Consumption.filter: { mandatory: true }
+  posting_date;
+
+  @UI.selectionField: [{ position: 40 }]
+  journal_entry_type;
+
+  @UI.selectionField: [{ position: 50 }]
+  journal_entry;
+
+  @UI.selectionField: [{ position: 60 }]
+  creation_date_time;
+
+  @UI.selectionField: [{ position: 70 }]
+  created_by_user;
+
+  @UI.selectionField: [{ position: 80 }]
+  is_reversed;
+
+  @UI.selectionField: [{ position: 90 }]
+  is_reversing;
+
+  @UI.selectionField: [{ position: 100 }]
+  status;
+
+  @UI.selectionField: [{ position: 110 }]
+  document_reference_id;
+
+  @UI.selectionField: [{ position: 120 }]
+  document_number;
+
+  @UI.selectionField: [{ position: 130 }]
+  customer;
+
+  @UI.selectionField: [{ position: 140 }]
+  supplier;
+
+  @UI.selectionField: [{ position: 150 }]
+  fixed_asset;
+
+  @UI.selectionField: [{ position: 160 }]
+  debit_gl_account;
+
+  @UI.selectionField: [{ position: 170 }]
+  credit_gl_account;
+
+  @UI.selectionField: [{ position: 180 }]
+  tax_code;
+
+  @UI.selectionField: [{ position: 190 }]
+  product;
+
+  @UI.selectionField: [{ position: 200 }]
+  cost_center;
+
+  @UI.selectionField: [{ position: 210 }]
+  profit_center;
+
+  // ------------------------------------------------------------------
+  // List Report table columns (FS section 2.2.3), in FS field order.
+  // ------------------------------------------------------------------
+  @UI.lineItem: [{ position: 10, label: 'Status' }]
+  status;
+
+  @UI.lineItem: [{ position: 20, label: 'So chung tu' }]
+  document_number;
+
+  @UI.lineItem: [{ position: 30, label: 'Ngay hoa don' }]
+  invoice_date;
+
+  @UI.lineItem: [{ position: 40, label: 'Document Reference ID' }]
+  document_reference_id;
+
+  @UI.lineItem: [{ position: 50, label: 'Ten don vi' }]
+  company_name;
+
+  @UI.lineItem: [{ position: 60, label: 'Customer' }]
+  customer;
+
+  @UI.lineItem: [{ position: 70, label: 'Supplier' }]
+  supplier;
+
+  @UI.lineItem: [{ position: 80, label: 'Fixed Asset' }]
+  fixed_asset;
+
+  @UI.lineItem: [{ position: 90, label: 'Journal Entry' }]
+  journal_entry;
+
+  @UI.lineItem: [{ position: 100, label: 'Item Text' }]
+  item_text;
+
+  @UI.lineItem: [{ position: 110, label: 'Journal Entry Type' }]
+  journal_entry_type;
+
+  @UI.lineItem: [{ position: 120, label: 'Posting Date' }]
+  posting_date;
+
+  @UI.lineItem: [{ position: 130, label: 'Journal Entry Date' }]
+  journal_entry_date;
+
+  @UI.lineItem: [{ position: 140, label: 'Debit Journal Entry Item' }]
+  debit_journal_entry_item;
+
+  @UI.lineItem: [{ position: 150, label: 'Credit Journal Entry Item' }]
+  credit_journal_entry_item;
+
+  @UI.lineItem: [{ position: 160, label: 'Debit G/L account' }]
+  debit_gl_account;
+
+  @UI.lineItem: [{ position: 170, label: 'Credit G/L account' }]
+  credit_gl_account;
+
+  @UI.lineItem: [{ position: 180, label: 'Debit Code' }]
+  debit_code;
+
+  @UI.lineItem: [{ position: 190, label: 'Credit Code' }]
+  credit_code;
+
+  @UI.lineItem: [{ position: 200, label: 'Debit Amount In Company Code Currency' }]
+  debit_amount_cc;
+
+  @UI.lineItem: [{ position: 210, label: 'Credit Amount In Company Code Currency' }]
+  credit_amount_cc;
+
+  @UI.lineItem: [{ position: 220, label: 'Debit Amount In Trans Currency' }]
+  debit_amount_tc;
+
+  @UI.lineItem: [{ position: 230, label: 'Credit Amount In Trans Currency' }]
+  credit_amount_tc;
+
+  @UI.lineItem: [{ position: 240, label: 'Base Unit of Measure' }]
+  base_unit_of_measure;
+
+  @UI.lineItem: [{ position: 250, label: 'Quantity' }]
+  quantity;
+
+  @UI.lineItem: [{ position: 260, label: 'Don gia' }]
+  unit_price;
+
+  @UI.lineItem: [{ position: 270, label: 'Thanh tien' }]
+  total_amount;
+
+  @UI.lineItem: [{ position: 280, label: 'Tax Code' }]
+  tax_code;
+
+  @UI.lineItem: [{ position: 290, label: 'Tax Amount' }]
+  tax_amount;
+
+  @UI.lineItem: [{ position: 300, label: 'Product' }]
+  product;
+
+  @UI.lineItem: [{ position: 310, label: 'Account Assignment' }]
+  account_assignment;
+
+  @UI.lineItem: [{ position: 320, label: 'Cost center' }]
+  cost_center;
+
+  @UI.lineItem: [{ position: 330, label: 'Profit Center' }]
+  profit_center;
+
+  @UI.lineItem: [{ position: 340, label: 'Dia chi' }]
+  address;
+
+  @UI.lineItem: [{ position: 350, label: 'Is Reversed' }]
+  is_reversed;
+
+  @UI.lineItem: [{ position: 360, label: 'Is Reversing' }]
+  is_reversing;
+}

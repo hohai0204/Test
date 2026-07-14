@@ -1,0 +1,10 @@
+implementation in class zbp_gl08_chungtughiso unique;
+strict ( 2 );
+
+// Read-only Custom Entity: the whole report is a "query" - no create/update/
+// delete, no draft. All data is produced on the fly by the query provider
+// class from I_GLAccountLineItem (see ZBP_GL08_CHUNGTUGHISO).
+define behavior for ZC_GL08_CHUNGTUGHISO
+{
+  query;
+}
