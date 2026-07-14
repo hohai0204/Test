@@ -1,26 +1,55 @@
 "! Query provider class for the ZGL08_ChungTuGhiSo custom entity.
 "!
-"! Implements the FS's core business rule (section 2.2, TH1/TH2/TH3): for
-"! each Journal Entry, debit and credit line items are paired into output
-"! rows, with whichever side has FEWER lines getting its shown amount
-"! derived as -1 * the paired line on the other (more itemized) side.
+"! v3 CHANGE LOG - the debit/credit pairing algorithm was REWRITTEN based on
+"! two real examples and business clarifications provided directly by the
+"! requester (not literally spelled out in the FS's TH1/TH2/TH3 text, which
+"! turned out to be an incomplete description of this same real algorithm):
 "!
-"! IMPORTANT - things you must verify/adjust against your own system before
-"! this compiles and runs (I have no live connection to your SAP system):
-"!   1. Field names of I_GLAccountLineItem used in read_line_items() - marked
-"!      "TODO VERIFY" wherever uncertain. Open the view in ADT (F2/Data
-"!      Preview) and adjust the SELECT's field list accordingly.
+"!   1. Lines are first grouped using the real "Offsetting Account" field
+"!      (confirmed to exist on I_GLAccountLineItem from a live screenshot):
+"!      a Debit line and a Credit line belong together if one line's
+"!      Offsetting Account equals the other line's G/L Account, OR - when
+"!      the offsetting side is a customer/vendor reconciliation posting -
+"!      equals the other line's Customer or Supplier.
+"!   2. Any line that doesn't link to anything via Offsetting Account falls
+"!      back to positional grouping: tax lines (TaxCode filled) are pulled
+"!      out first; the remaining lines are walked in document order and
+"!      every new Debit line starts a new group (subsequent Credit lines
+"!      join that group until the next Debit line starts a new one); the
+"!      pulled-out tax lines are then added back into whichever resulting
+"!      group is furthest from balancing (debit total <> credit total).
+"!   3. Within each resulting group, amounts are allocated with a waterfall
+"!      algorithm to minimize the number of splits: sort Debit lines by
+"!      amount descending and Credit lines by amount descending too (ACDOCA
+"!      convention: Debit amounts are stored positive, Credit amounts
+"!      negative, so "descending" gives largest-absolute-first for Debit and
+"!      smallest-absolute-first for Credit) and repeatedly consume
+"!      min(abs(remaining debit), abs(remaining credit)) from the current
+"!      pair, emitting one output row per consumption, advancing whichever
+"!      side reaches zero, until both lists are exhausted.
+"!
+"!   This single algorithm reproduces the FS's TH1/TH2/TH3 examples exactly
+"!   when there is no Offsetting Account data (pure positional fallback: a
+"!   lone Debit or Credit line simply keeps absorbing/being absorbed by the
+"!   other side's lines one at a time), while additionally handling real
+"!   documents correctly when Offsetting Account data lets specific lines be
+"!   linked instead of guessed at via a blind cross join (the v2 approach).
+"!
+"! STILL UNVERIFIED (I have no live connection to your SAP system):
+"!   1. Every field marked "TODO VERIFY" below - open I_GLAccountLineItem in
+"!      ADT (F2 / Data Preview) and adjust the SELECT's field list. The
+"!      "Offsetting Account" field name below is my best guess at its exact
+"!      CDS spelling (OffsettingAccount) - confirm it matches what you saw
+"!      in your screenshot.
 "!   2. The exact IF_RAP_QUERY_PROVIDER / IF_RAP_QUERY_REQUEST method
 "!      signatures below (paging, response object creation) can differ
-"!      slightly by release. If activation fails on those calls, regenerate
-"!      this class's skeleton via ADT ("New Behavior Definition" wizard for
-"!      a Custom Entity) for your exact release, then drop the business
-"!      logic methods (read_line_items / combine_debit_credit /
-"!      fill_common_fields) into it unchanged.
-"!   3. The row-cardinality assumptions documented in combine_debit_credit()
-"!      for the n1=n2 case and the general n1<>n2 (both >1) case are NOT
-"!      explicitly stated in the FS - confirm with the FS author using real
-"!      sample documents before go-live.
+"!      slightly by release.
+"!   3. What happens when a group still doesn't balance to zero after tax
+"!      reinsertion (data quality issue, or a document type this algorithm
+"!      doesn't anticipate) - currently the waterfall simply leaves a
+"!      residual unmatched amount on whichever side has lines left over
+"!      when the other side is exhausted; that residual line is dropped
+"!      (see waterfall_allocate). Flag if this needs different handling.
 CLASS zbp_gl08_chungtughiso DEFINITION
   PUBLIC
   FINAL
@@ -32,44 +61,60 @@ CLASS zbp_gl08_chungtughiso DEFINITION
   PRIVATE SECTION.
     TYPES:
       "! One row as read from I_GLAccountLineItem (one row per GL line item,
-      "! i.e. BEFORE debit/credit pairing). TODO VERIFY every field name.
+      "! i.e. BEFORE debit/credit pairing).
       BEGIN OF ty_raw,
-        company_code               TYPE bukrs,
-        fiscal_year                 TYPE gjahr,
-        accounting_document         TYPE belnr_d,
-        journal_entry_item          TYPE docln6,
-        gl_account                  TYPE saknr,
-        debit_credit_code           TYPE shkzg,
-        posting_date                TYPE budat,
-        document_date               TYPE bldat,
-        creation_date_time          TYPE cpudt,
-        created_by_user             TYPE usnam,
-        accounting_document_type    TYPE blart,
-        amount_in_company_code_ccy  TYPE wrbtr,
-        company_code_currency       TYPE waers,
-        amount_in_transaction_ccy   TYPE wrbtr,
-        transaction_currency        TYPE waers,
-        document_reference_id       TYPE xblnr1,
-        customer                    TYPE kunnr,
-        supplier                    TYPE lifnr,
-        fixed_asset                 TYPE anln1,
-        item_text                   TYPE sgtxt,
-        quantity                    TYPE menge_d,
-        base_unit_of_measure        TYPE meins,
-        tax_code                    TYPE mwskz,
-        tax_amount                  TYPE wmwst,
-        product                     TYPE matnr,
-        cost_center                 TYPE kostl,
-        profit_center               TYPE prctr,
-        is_reversed                 TYPE abap_boolean,
-        is_reversing                TYPE abap_boolean,
-        status                      TYPE char1,
+        company_code                TYPE bukrs,
+        fiscal_year                  TYPE gjahr,
+        accounting_document          TYPE belnr_d,
+        ledger                       TYPE rldnr,       " confirmed: ACDOCA/RLDNR - not in FS as a filter, hardcoded to leading ledger below
+        ledger_gl_line_item          TYPE docln6,        " confirmed field: LedgerGLLineItem (ACDOCA-DOCLN, 6 chars)
+        gl_account                   TYPE saknr,
+        offsetting_account           TYPE char10,        " confirmed to exist (user screenshot); exact CDS name still TODO VERIFY
+        debit_credit_code            TYPE shkzg,
+        posting_date                 TYPE budat,
+        document_date                TYPE bldat,
+        creation_date_time           TYPE cpudt,
+        created_by_user              TYPE usnam,
+        accounting_document_type     TYPE blart,
+        amount_in_company_code_ccy   TYPE wrbtr,
+        company_code_currency        TYPE waers,
+        amount_in_transaction_ccy    TYPE wrbtr,
+        transaction_currency         TYPE waers,
+        document_reference_id        TYPE xblnr1,
+        customer                     TYPE kunnr,
+        supplier                     TYPE lifnr,
+        fixed_asset                  TYPE anln1,
+        item_text                    TYPE sgtxt,
+        quantity                     TYPE menge_d,
+        base_unit_of_measure         TYPE meins,
+        tax_code                     TYPE mwskz,
+        tax_amount                   TYPE wmwst,
+        product                      TYPE matnr,
+        cost_center                  TYPE kostl,
+        profit_center                TYPE prctr,
+        is_reversed                  TYPE abap_boolean,  " confirmed field: IsReversed
+        reversal_reason              TYPE bkpf-stgrd,    " confirmed field: ReversalReason
+        reverse_document             TYPE belnr_d,       " confirmed field: ReverseDocument
+        clearing_date                TYPE budat,         " confirmed field: ClearingDate
+        clearing_accounting_document TYPE belnr_d,       " confirmed field: ClearingAccountingDocument
       END OF ty_raw.
     TYPES ty_raw_tab TYPE STANDARD TABLE OF ty_raw WITH EMPTY KEY.
     TYPES ty_result_tab TYPE STANDARD TABLE OF zc_gl08_chungtughiso WITH EMPTY KEY.
 
-    CONSTANTS c_debit  TYPE shkzg VALUE 'S'.
-    CONSTANTS c_credit TYPE shkzg VALUE 'H'.
+    "! One matching group: some Debit lines and some Credit lines that
+    "! belong together (either via Offsetting Account, or via the positional
+    "! fallback) and must balance to zero once fully allocated.
+    TYPES: BEGIN OF ty_cluster,
+             debit  TYPE ty_raw_tab,
+             credit TYPE ty_raw_tab,
+           END OF ty_cluster.
+    TYPES ty_cluster_tab TYPE STANDARD TABLE OF ty_cluster WITH EMPTY KEY.
+
+    CONSTANTS c_debit          TYPE shkzg VALUE 'S'.
+    CONSTANTS c_credit         TYPE shkzg VALUE 'H'.
+    CONSTANTS c_leading_ledger TYPE rldnr VALUE '0L'.
+    CONSTANTS c_status_open    TYPE char1 VALUE 'O'.
+    CONSTANTS c_status_cleared TYPE char1 VALUE 'C'.
 
     METHODS read_line_items
       IMPORTING
@@ -79,9 +124,9 @@ CLASS zbp_gl08_chungtughiso DEFINITION
       RAISING
         cx_rap_query_provider.
 
-    "! Pairs one document's debit lines against its credit lines per FS
-    "! rules TH1/TH2/TH3 (amount sign-flip only - see class doc for the
-    "! row-cardinality assumptions in the n1=n2 and general n1<>n2 cases).
+    "! Top-level entry point for one document's pairing: builds Offsetting
+    "! Account groups, falls back positionally for anything left over, then
+    "! runs the waterfall allocation on every resulting group.
     METHODS combine_debit_credit
       IMPORTING
         it_debit         TYPE ty_raw_tab
@@ -89,8 +134,56 @@ CLASS zbp_gl08_chungtughiso DEFINITION
       RETURNING
         VALUE(rt_result) TYPE ty_result_tab.
 
-    "! Fills every output field that does NOT depend on the TH1/TH2/TH3
-    "! amount derivation (references, texts, quantity/unit price, ...).
+    "! True if a Debit line and a Credit line reference each other via
+    "! Offsetting Account (either direction), matching G/L Account or,
+    "! when the offset is a business partner posting, Customer/Supplier.
+    METHODS is_linked
+      IMPORTING
+        is_debit        TYPE ty_raw
+        is_credit       TYPE ty_raw
+      RETURNING
+        VALUE(rv_linked) TYPE abap_bool.
+
+    "! Groups debit/credit lines that are linked via Offsetting Account
+    "! (transitively - if A links to B and B links to C, all three group
+    "! together). Lines with no link to anything on the other side are
+    "! returned separately as leftovers for the positional fallback.
+    METHODS cluster_by_offsetting_account
+      IMPORTING
+        it_debit             TYPE ty_raw_tab
+        it_credit            TYPE ty_raw_tab
+      EXPORTING
+        et_clusters          TYPE ty_cluster_tab
+        et_leftover_debit    TYPE ty_raw_tab
+        et_leftover_credit   TYPE ty_raw_tab.
+
+    "! Positional fallback for lines with no Offsetting Account link: tax
+    "! lines are excluded first, remaining lines are walked in document
+    "! order (each new Debit line starts a new group), then excluded tax
+    "! lines are reinserted into whichever group is furthest from balancing.
+    METHODS cluster_by_position_fallback
+      IMPORTING
+        it_leftover_debit    TYPE ty_raw_tab
+        it_leftover_credit   TYPE ty_raw_tab
+      RETURNING
+        VALUE(rt_clusters)   TYPE ty_cluster_tab.
+
+    "! Allocates amounts within a single group by repeatedly consuming
+    "! min(abs(remaining debit), abs(remaining credit)) from the largest
+    "! remaining Debit line against the smallest remaining Credit line,
+    "! emitting one output row per consumption (see class doc for why this
+    "! reproduces the FS's TH1/TH2/TH3 examples as special cases).
+    METHODS waterfall_allocate
+      IMPORTING
+        it_debit         TYPE ty_raw_tab
+        it_credit        TYPE ty_raw_tab
+      RETURNING
+        VALUE(rt_result) TYPE ty_result_tab.
+
+    "! Fills every output field that does NOT depend on the waterfall
+    "! amount allocation (references, texts, quantity/unit price, ...).
+    "! NOTE: quantity/unit price are NOT prorated when a line's amount gets
+    "! split across multiple output rows - a known simplification.
     METHODS fill_common_fields
       IMPORTING
         is_debit      TYPE ty_raw
@@ -106,7 +199,7 @@ CLASS zbp_gl08_chungtughiso IMPLEMENTATION.
   METHOD if_rap_query_provider~select.
 
     DATA(lt_raw) = read_line_items( io_request ).
-    SORT lt_raw BY company_code fiscal_year accounting_document journal_entry_item ASCENDING.
+    SORT lt_raw BY company_code fiscal_year accounting_document ledger_gl_line_item ASCENDING.
 
     DATA lt_result TYPE ty_result_tab.
     DATA lt_debit  TYPE ty_raw_tab.
@@ -134,8 +227,8 @@ CLASS zbp_gl08_chungtughiso IMPLEMENTATION.
       " across all DEBIT lines of this one document - repeated on every
       " output row belonging to this document (a document-level total,
       " deliberately NOT the same as the per-row debit/credit amount
-      " columns, which get sign-flipped/derived per TH1-TH3 and would
-      " double count if simply summed in the UI footer).
+      " columns, which get split/allocated and would double count if simply
+      " summed in the UI footer).
       DATA(lv_total_amount) = REDUCE wrbtr( INIT sum = 0
                                              FOR ls_d IN lt_debit
                                              NEXT sum = sum + ls_d-amount_in_company_code_ccy ).
@@ -215,42 +308,54 @@ CLASS zbp_gl08_chungtughiso IMPLEMENTATION.
     DATA(lt_range_document_ref_id)   = io_request->get_filter( )->get_as_ranges( 'DOCUMENT_REFERENCE_ID' ).
 
     " NOTE: "Debit G/L account", "Credit G/L account", Is Reversed/Is
-    " Reversing filters only make sense AFTER TH1/TH2/TH3 pairing (they are
-    " not properties of a single I_GLAccountLineItem row) - apply those as
-    " an extra FILTER on rt_raw/lt_result if the business needs them pushed
+    " Reversing filters only make sense AFTER pairing (they are not
+    " properties of a single I_GLAccountLineItem row) - apply those as an
+    " extra FILTER on rt_raw/lt_result if the business needs them pushed
     " down; small, isolated extension point.
 
-    SELECT FROM i_glaccountlineitem                              "#EC CI_NOORDER
+    " NOTE: FS does not expose "Ledger" as a selection parameter. Hardcoded
+    " to the leading ledger (0L) below - add a real filter/parameter if
+    " parallel ledgers are in scope for this report.
+
+    SELECT FROM i_glaccountlineitem                                    "#EC CI_NOORDER
       FIELDS
-        companycode                AS company_code,
-        fiscalyear                  AS fiscal_year,
-        accountingdocument           AS accounting_document,
-        glaccountlineitem            AS journal_entry_item,        "TODO VERIFY
-        glaccount                    AS gl_account,
-        debitcreditcode              AS debit_credit_code,
-        postingdate                  AS posting_date,
-        documentdate                  AS document_date,             "TODO VERIFY: also used for "Journal Entry Date"?
-        journalentrycreatedbyuser      AS created_by_user,           "TODO VERIFY field name
-        accountingdocumenttype          AS accounting_document_type,
-        amountincompanycodecurrency      AS amount_in_company_code_ccy,
-        companycodecurrency                AS company_code_currency,
-        amountintransactioncurrency          AS amount_in_transaction_ccy,
-        transactioncurrency                    AS transaction_currency,
-        documentreferenceid                      AS document_reference_id,
-        customer                                   AS customer,
-        supplier                                     AS supplier,
-        fixedasset                                    AS fixed_asset,
-        documentitemtext                                AS item_text,   "TODO VERIFY field name
-        quantity                                          AS quantity,
-        baseunit                                            AS base_unit_of_measure,
-        taxcode                                               AS tax_code,
-        taxamount                                               AS tax_amount,
-        product                                                   AS product,   "TODO VERIFY: may be "material"
-        costcenter                                                 AS cost_center,
-        profitcenter                                                 AS profit_center
+        companycode                    AS company_code,
+        fiscalyear                      AS fiscal_year,
+        accountingdocument               AS accounting_document,
+        ledger                            AS ledger,
+        ledgergllineitem                   AS ledger_gl_line_item,       " confirmed: LedgerGLLineItem
+        glaccount                          AS gl_account,
+        offsettingaccount                   AS offsetting_account,       " TODO VERIFY exact spelling (per your screenshot)
+        debitcreditcode                       AS debit_credit_code,
+        postingdate                            AS posting_date,
+        documentdate                            AS document_date,        "TODO VERIFY: also used for "Journal Entry Date"? (FS #3 vs #13)
+        journalentrycreatedbyuser                AS created_by_user,     " medium-high confidence: FS's own param label matches this name
+        accountingdocumenttype                    AS accounting_document_type,
+        amountincompanycodecurrency                AS amount_in_company_code_ccy,
+        companycodecurrency                          AS company_code_currency,
+        amountintransactioncurrency                    AS amount_in_transaction_ccy,
+        transactioncurrency                              AS transaction_currency,
+        documentreferenceid                                AS document_reference_id,
+        customer                                             AS customer,
+        supplier                                               AS supplier,
+        fixedasset                                              AS fixed_asset,
+        documentitemtext                                          AS item_text,   "TODO VERIFY field name
+        quantity                                                    AS quantity,
+        baseunit                                                      AS base_unit_of_measure,
+        taxcode                                                         AS tax_code,
+        taxamount                                                         AS tax_amount,
+        product                                                             AS product,   "TODO VERIFY: may be "material"
+        costcenter                                                           AS cost_center,
+        profitcenter                                                           AS profit_center,
+        isreversed                                                               AS is_reversed,              " confirmed
+        reversalreason                                                            AS reversal_reason,          " confirmed
+        reversedocument                                                            AS reverse_document,        " confirmed
+        clearingdate                                                                 AS clearing_date,
+        clearingaccountingdocument                                                   AS clearing_accounting_document " confirmed
       WHERE
             companycode IN @lt_range_company_code
         AND postingdate IN @lt_range_posting_date
+        AND ledger      = @c_leading_ledger
         AND ( @lt_range_gl_account         IS INITIAL OR glaccount              IN @lt_range_gl_account )
         AND ( @lt_range_journal_entry_type IS INITIAL OR accountingdocumenttype IN @lt_range_journal_entry_type )
         AND ( @lt_range_journal_entry      IS INITIAL OR accountingdocument     IN @lt_range_journal_entry )
@@ -264,74 +369,278 @@ CLASS zbp_gl08_chungtughiso IMPLEMENTATION.
         AND ( @lt_range_document_ref_id    IS INITIAL OR documentreferenceid    IN @lt_range_document_ref_id )
       INTO CORRESPONDING FIELDS OF TABLE @rt_raw.
 
-    " status / is_reversed / is_reversing / creation_date_time are left as
-    " TODOs here (not wired into the SELECT above) - see README "Known gaps".
+    " creation_date_time (date+time as one field vs two separate fields on
+    " the real view) is still a TODO - see README "Known gaps".
 
   ENDMETHOD.
 
 
   METHOD combine_debit_credit.
 
-    DATA(n1) = lines( it_debit ).
-    DATA(n2) = lines( it_credit ).
-
-    IF n1 = 0 OR n2 = 0.
+    IF it_debit IS INITIAL OR it_credit IS INITIAL.
       " Document has only one side (e.g. a one-sided/statistical posting) -
-      " the FS does not define pairing for this case, so it is skipped.
+      " no pairing is defined for this case, so it is skipped.
       RETURN.
     ENDIF.
 
-    IF n1 = n2.
-      " ASSUMPTION (the FS's TH1/TH2/TH3 only define n1=1<n2, n2=1<n1, and
-      " n1<>n2 both >1 - it is silent on n1=n2): pair 1:1 in ascending item
-      " order, both sides keep their OWN real amounts. CONFIRM with the FS
-      " author before go-live.
-      DO n1 TIMES.
-        DATA(lv_idx) = sy-index.
-        DATA(ls_row_eq) = fill_common_fields( is_debit  = it_debit[ lv_idx ]
-                                               is_credit = it_credit[ lv_idx ] ).
-        ls_row_eq-debit_amount_cc  = it_debit[ lv_idx ]-amount_in_company_code_ccy.
-        ls_row_eq-credit_amount_cc = it_credit[ lv_idx ]-amount_in_company_code_ccy.
-        ls_row_eq-debit_amount_tc  = it_debit[ lv_idx ]-amount_in_transaction_ccy.
-        ls_row_eq-credit_amount_tc = it_credit[ lv_idx ]-amount_in_transaction_ccy.
-        APPEND ls_row_eq TO rt_result.
-      ENDDO.
+    DATA lt_clusters        TYPE ty_cluster_tab.
+    DATA lt_leftover_debit  TYPE ty_raw_tab.
+    DATA lt_leftover_credit TYPE ty_raw_tab.
+
+    cluster_by_offsetting_account(
+      EXPORTING it_debit           = it_debit
+                it_credit          = it_credit
+      IMPORTING et_clusters        = lt_clusters
+                et_leftover_debit  = lt_leftover_debit
+                et_leftover_credit = lt_leftover_credit ).
+
+    APPEND LINES OF cluster_by_position_fallback(
+                       it_leftover_debit  = lt_leftover_debit
+                       it_leftover_credit = lt_leftover_credit ) TO lt_clusters.
+
+    LOOP AT lt_clusters INTO DATA(ls_cluster).
+      APPEND LINES OF waterfall_allocate( it_debit  = ls_cluster-debit
+                                          it_credit = ls_cluster-credit ) TO rt_result.
+    ENDLOOP.
+
+  ENDMETHOD.
+
+
+  METHOD is_linked.
+
+    rv_linked = xsdbool(
+         ( is_debit-offsetting_account IS NOT INITIAL
+           AND ( is_debit-offsetting_account = is_credit-gl_account
+              OR is_debit-offsetting_account = is_credit-customer
+              OR is_debit-offsetting_account = is_credit-supplier ) )
+      OR ( is_credit-offsetting_account IS NOT INITIAL
+           AND ( is_credit-offsetting_account = is_debit-gl_account
+              OR is_credit-offsetting_account = is_debit-customer
+              OR is_credit-offsetting_account = is_debit-supplier ) ) ).
+
+  ENDMETHOD.
+
+
+  METHOD cluster_by_offsetting_account.
+
+    TYPES: BEGIN OF ty_tagged,
+             line          TYPE ty_raw,
+             is_debit_side TYPE abap_bool,
+             cluster_id    TYPE i,
+           END OF ty_tagged.
+    DATA lt_tagged TYPE STANDARD TABLE OF ty_tagged WITH EMPTY KEY.
+
+    LOOP AT it_debit INTO DATA(ls_d).
+      APPEND VALUE #( line = ls_d is_debit_side = abap_true cluster_id = sy-tabix ) TO lt_tagged.
+    ENDLOOP.
+    DATA(lv_offset) = lines( it_debit ).
+    LOOP AT it_credit INTO DATA(ls_c).
+      APPEND VALUE #( line = ls_c is_debit_side = abap_false cluster_id = lv_offset + sy-tabix ) TO lt_tagged.
+    ENDLOOP.
+
+    " Simple union-find by repeated relabeling (small n per document - a
+    " journal entry rarely has more than a handful of line items).
+    DATA(lv_changed) = abap_true.
+    WHILE lv_changed = abap_true.
+      lv_changed = abap_false.
+      LOOP AT lt_tagged ASSIGNING FIELD-SYMBOL(<a>) WHERE is_debit_side = abap_true.
+        LOOP AT lt_tagged ASSIGNING FIELD-SYMBOL(<b>) WHERE is_debit_side = abap_false.
+          IF <a>-cluster_id <> <b>-cluster_id AND is_linked( is_debit = <a>-line is_credit = <b>-line ) = abap_true.
+            DATA(lv_old_id) = <b>-cluster_id.
+            DATA(lv_new_id) = <a>-cluster_id.
+            LOOP AT lt_tagged ASSIGNING FIELD-SYMBOL(<c>) WHERE cluster_id = lv_old_id.
+              <c>-cluster_id = lv_new_id.
+            ENDLOOP.
+            lv_changed = abap_true.
+          ENDIF.
+        ENDLOOP.
+      ENDLOOP.
+    ENDWHILE.
+
+    SORT lt_tagged BY cluster_id ASCENDING.
+
+    LOOP AT lt_tagged INTO DATA(ls_tagged)
+         GROUP BY ( id = ls_tagged-cluster_id ) ASCENDING
+         REFERENCE INTO DATA(lo_grp).
+
+      DATA lt_grp_debit  TYPE ty_raw_tab.
+      DATA lt_grp_credit TYPE ty_raw_tab.
+      CLEAR: lt_grp_debit, lt_grp_credit.
+
+      LOOP AT GROUP lo_grp INTO DATA(ls_member).
+        IF ls_member-is_debit_side = abap_true.
+          APPEND ls_member-line TO lt_grp_debit.
+        ELSE.
+          APPEND ls_member-line TO lt_grp_credit.
+        ENDIF.
+      ENDLOOP.
+
+      IF lt_grp_debit IS NOT INITIAL AND lt_grp_credit IS NOT INITIAL.
+        APPEND VALUE #( debit = lt_grp_debit credit = lt_grp_credit ) TO et_clusters.
+      ELSE.
+        APPEND LINES OF lt_grp_debit  TO et_leftover_debit.
+        APPEND LINES OF lt_grp_credit TO et_leftover_credit.
+      ENDIF.
+
+    ENDLOOP.
+
+  ENDMETHOD.
+
+
+  METHOD cluster_by_position_fallback.
+
+    DATA lt_debit_main  TYPE ty_raw_tab.
+    DATA lt_credit_main TYPE ty_raw_tab.
+    DATA lt_tax_lines   TYPE ty_raw_tab.
+
+    LOOP AT it_leftover_debit INTO DATA(ls_ld).
+      IF ls_ld-tax_code IS NOT INITIAL.
+        APPEND ls_ld TO lt_tax_lines.
+      ELSE.
+        APPEND ls_ld TO lt_debit_main.
+      ENDIF.
+    ENDLOOP.
+    LOOP AT it_leftover_credit INTO DATA(ls_lc).
+      IF ls_lc-tax_code IS NOT INITIAL.
+        APPEND ls_lc TO lt_tax_lines.
+      ELSE.
+        APPEND ls_lc TO lt_credit_main.
+      ENDIF.
+    ENDLOOP.
+
+    " Walk the remaining (non-tax) lines in original document order: every
+    " new Debit line opens a new group, subsequent Credit lines join it
+    " until the next Debit line starts another group.
+    DATA lt_ordered TYPE ty_raw_tab.
+    APPEND LINES OF lt_debit_main  TO lt_ordered.
+    APPEND LINES OF lt_credit_main TO lt_ordered.
+    SORT lt_ordered BY ledger_gl_line_item ASCENDING.
+
+    DATA lt_cur_debit         TYPE ty_raw_tab.
+    DATA lt_cur_credit        TYPE ty_raw_tab.
+    DATA lv_have_open_cluster TYPE abap_bool VALUE abap_false.
+
+    LOOP AT lt_ordered INTO DATA(ls_o).
+      IF ls_o-debit_credit_code = c_debit.
+        IF lv_have_open_cluster = abap_true.
+          APPEND VALUE #( debit = lt_cur_debit credit = lt_cur_credit ) TO rt_clusters.
+          CLEAR: lt_cur_debit, lt_cur_credit.
+        ENDIF.
+        APPEND ls_o TO lt_cur_debit.
+        lv_have_open_cluster = abap_true.
+      ELSE.
+        APPEND ls_o TO lt_cur_credit.
+      ENDIF.
+    ENDLOOP.
+    IF lv_have_open_cluster = abap_true.
+      APPEND VALUE #( debit = lt_cur_debit credit = lt_cur_credit ) TO rt_clusters.
+    ENDIF.
+
+    " Reinsert excluded tax lines into whichever group is furthest from
+    " balancing (business rule: "nhom nao thieu thi bu thue vao").
+    LOOP AT lt_tax_lines INTO DATA(ls_tax).
+      DATA(lv_best_idx) = 0.
+      DATA(lv_best_gap) = 0.
+      LOOP AT rt_clusters ASSIGNING FIELD-SYMBOL(<cl>).
+        DATA(lv_debit_total)  = REDUCE wrbtr( INIT s = 0 FOR d IN <cl>-debit  NEXT s = s + d-amount_in_company_code_ccy ).
+        DATA(lv_credit_total) = REDUCE wrbtr( INIT s = 0 FOR c IN <cl>-credit NEXT s = s + c-amount_in_company_code_ccy ).
+        DATA(lv_gap) = abs( lv_debit_total + lv_credit_total ).
+        IF lv_gap > lv_best_gap.
+          lv_best_gap = lv_gap.
+          lv_best_idx = sy-tabix.
+        ENDIF.
+      ENDLOOP.
+
+      IF lv_best_idx = 0 AND rt_clusters IS NOT INITIAL.
+        " No group is out of balance (or none found) - do not silently drop
+        " the tax line's amount; attach it to the first group instead.
+        lv_best_idx = 1.
+      ENDIF.
+
+      IF lv_best_idx > 0.
+        IF ls_tax-debit_credit_code = c_debit.
+          APPEND ls_tax TO rt_clusters[ lv_best_idx ]-debit.
+        ELSE.
+          APPEND ls_tax TO rt_clusters[ lv_best_idx ]-credit.
+        ENDIF.
+      ENDIF.
+    ENDLOOP.
+
+  ENDMETHOD.
+
+
+  METHOD waterfall_allocate.
+
+    IF it_debit IS INITIAL OR it_credit IS INITIAL.
       RETURN.
     ENDIF.
 
-    " TH1 (n1=1,n2>1) / TH3's n1<n2 branch: credit lines are the "real"
-    " itemized side, kept as-is; debit is derived per row as -1 * that row's
-    " credit amount. TH2 (n2=1,n1>1) / TH3's n1>n2 branch: symmetric.
-    "
-    " ASSUMPTION for the general n1<>n2 (both >1) case: the FS states the
-    " amount-override rule but does not spell out row cardinality. This is
-    " the literal reading - a full cross join (n1 x n2 rows) of which
-    " TH1/TH2 are the special cases where one side has exactly 1 line.
-    " CONFIRM with the FS author using real sample documents; watch out for
-    " row-count explosion on documents with many lines on both sides.
-    IF n1 < n2.
-      LOOP AT it_debit INTO DATA(ls_debit).
-        LOOP AT it_credit INTO DATA(ls_credit).
-          DATA(ls_row_lt) = fill_common_fields( is_debit = ls_debit is_credit = ls_credit ).
-          ls_row_lt-credit_amount_cc = ls_credit-amount_in_company_code_ccy.
-          ls_row_lt-credit_amount_tc = ls_credit-amount_in_transaction_ccy.
-          ls_row_lt-debit_amount_cc  = ls_credit-amount_in_company_code_ccy * -1.
-          ls_row_lt-debit_amount_tc  = ls_credit-amount_in_transaction_ccy * -1.
-          APPEND ls_row_lt TO rt_result.
-        ENDLOOP.
-      ENDLOOP.
-    ELSE. " n1 > n2
-      LOOP AT it_debit INTO ls_debit.
-        LOOP AT it_credit INTO ls_credit.
-          DATA(ls_row_gt) = fill_common_fields( is_debit = ls_debit is_credit = ls_credit ).
-          ls_row_gt-debit_amount_cc  = ls_debit-amount_in_company_code_ccy.
-          ls_row_gt-debit_amount_tc  = ls_debit-amount_in_transaction_ccy.
-          ls_row_gt-credit_amount_cc = ls_debit-amount_in_company_code_ccy * -1.
-          ls_row_gt-credit_amount_tc = ls_debit-amount_in_transaction_ccy * -1.
-          APPEND ls_row_gt TO rt_result.
-        ENDLOOP.
-      ENDLOOP.
-    ENDIF.
+    DATA lt_debit  TYPE ty_raw_tab.
+    DATA lt_credit TYPE ty_raw_tab.
+    lt_debit  = it_debit.
+    lt_credit = it_credit.
+
+    " ASSUMPTION (ACDOCA sign convention): Debit amounts are stored positive,
+    " Credit amounts negative. Sorting both DESCENDING therefore yields
+    " "largest absolute amount first" for Debit and "smallest absolute
+    " amount first" for Credit - i.e. the confirmed business rule "chia so
+    " lon theo so nho, it phai chia nho nhat" (consume the bigger line using
+    " the smaller ones first, to minimize the number of splits).
+    SORT lt_debit  BY amount_in_company_code_ccy DESCENDING.
+    SORT lt_credit BY amount_in_company_code_ccy DESCENDING.
+
+    DATA(lv_di) = 1.
+    DATA(lv_ci) = 1.
+    DATA(lv_debit_rem_cc)  = lt_debit[ 1 ]-amount_in_company_code_ccy.
+    DATA(lv_debit_rem_tc)  = lt_debit[ 1 ]-amount_in_transaction_ccy.
+    DATA(lv_credit_rem_cc) = lt_credit[ 1 ]-amount_in_company_code_ccy.
+    DATA(lv_credit_rem_tc) = lt_credit[ 1 ]-amount_in_transaction_ccy.
+
+    WHILE lv_di <= lines( lt_debit ) AND lv_ci <= lines( lt_credit ).
+
+      DATA(ls_row) = fill_common_fields( is_debit  = lt_debit[ lv_di ]
+                                          is_credit = lt_credit[ lv_ci ] ).
+
+      " Consume the smaller remaining absolute amount this round - that
+      " side is fully closed out, the other side carries its remainder to
+      " the next iteration (possibly matched against the NEXT line on the
+      " side that just closed).
+      DATA(lv_alloc_cc) = COND wrbtr( WHEN abs( lv_debit_rem_cc ) <= abs( lv_credit_rem_cc )
+                                       THEN lv_debit_rem_cc
+                                       ELSE 0 - lv_credit_rem_cc ).
+      DATA(lv_alloc_tc) = COND wrbtr( WHEN abs( lv_debit_rem_cc ) <= abs( lv_credit_rem_cc )
+                                       THEN lv_debit_rem_tc
+                                       ELSE 0 - lv_credit_rem_tc ).
+
+      ls_row-debit_amount_cc  = lv_alloc_cc.
+      ls_row-debit_amount_tc  = lv_alloc_tc.
+      ls_row-credit_amount_cc = 0 - lv_alloc_cc.
+      ls_row-credit_amount_tc = 0 - lv_alloc_tc.
+
+      APPEND ls_row TO rt_result.
+
+      lv_debit_rem_cc  = lv_debit_rem_cc  - lv_alloc_cc.
+      lv_debit_rem_tc  = lv_debit_rem_tc  - lv_alloc_tc.
+      lv_credit_rem_cc = lv_credit_rem_cc + lv_alloc_cc.
+      lv_credit_rem_tc = lv_credit_rem_tc + lv_alloc_tc.
+
+      IF lv_debit_rem_cc = 0.
+        lv_di = lv_di + 1.
+        IF lv_di <= lines( lt_debit ).
+          lv_debit_rem_cc = lt_debit[ lv_di ]-amount_in_company_code_ccy.
+          lv_debit_rem_tc = lt_debit[ lv_di ]-amount_in_transaction_ccy.
+        ENDIF.
+      ENDIF.
+
+      IF lv_credit_rem_cc = 0.
+        lv_ci = lv_ci + 1.
+        IF lv_ci <= lines( lt_credit ).
+          lv_credit_rem_cc = lt_credit[ lv_ci ]-amount_in_company_code_ccy.
+          lv_credit_rem_tc = lt_credit[ lv_ci ]-amount_in_transaction_ccy.
+        ENDIF.
+      ENDIF.
+
+    ENDWHILE.
 
   ENDMETHOD.
 
@@ -342,15 +651,24 @@ CLASS zbp_gl08_chungtughiso IMPLEMENTATION.
     rs_row-fiscal_year                = is_debit-fiscal_year.
     rs_row-accounting_document        = is_debit-accounting_document.
     rs_row-journal_entry               = is_debit-accounting_document.
-    rs_row-debit_journal_entry_item    = is_debit-journal_entry_item.
-    rs_row-credit_journal_entry_item   = is_credit-journal_entry_item.
+    rs_row-debit_journal_entry_item    = is_debit-ledger_gl_line_item.
+    rs_row-credit_journal_entry_item   = is_credit-ledger_gl_line_item.
 
     rs_row-debit_gl_account            = is_debit-gl_account.
     rs_row-credit_gl_account           = is_credit-gl_account.
     rs_row-debit_code                  = is_debit-debit_credit_code.
     rs_row-credit_code                 = is_credit-debit_credit_code.
 
-    rs_row-status                      = is_debit-status.
+    " FS #1 "Status": derived from clearing info (ClearingDate /
+    " ClearingAccountingDocument). ASSUMPTION: taken from the Debit line;
+    " clearing status is tracked per GL line item and could in principle
+    " differ between the debit and credit side of the same document -
+    " confirm with the FS author whether that's possible/relevant.
+    rs_row-status = COND #( WHEN is_debit-clearing_date IS NOT INITIAL
+                               OR is_debit-clearing_accounting_document IS NOT INITIAL
+                             THEN c_status_cleared
+                             ELSE c_status_open ).
+
     " TODO VERIFY: FS lists "So chung tu" as a separate output field (#2)
     " from "Journal Entry" (#9) and from "Document Reference ID" (#4) - the
     " exact distinct source is unclear from the FS text; defaulted here to
@@ -374,9 +692,9 @@ CLASS zbp_gl08_chungtughiso IMPLEMENTATION.
     rs_row-transaction_currency        = is_debit-transaction_currency.
 
     " --- FS fields 25/26: Quantity / Don gia (unit price) -------------------
+    " NOTE: not prorated when a line's amount is split across several
+    " output rows (see class doc) - a known simplification.
     IF is_debit-quantity IS NOT INITIAL.
-      " Covers both TH3 ("both sides have quantity -> use Debit's data") and
-      " the "only Debit has quantity" case - both use Debit's own numbers.
       rs_row-quantity             = is_debit-quantity.
       rs_row-base_unit_of_measure = is_debit-base_unit_of_measure.
       rs_row-unit_price           = is_debit-amount_in_company_code_ccy / is_debit-quantity.
@@ -394,8 +712,18 @@ CLASS zbp_gl08_chungtughiso IMPLEMENTATION.
     rs_row-product             = is_debit-product.
     rs_row-cost_center         = is_debit-cost_center.
     rs_row-profit_center       = is_debit-profit_center.
+
+    " FS #35 "Is Reversed": taken from the confirmed IsReversed field.
     rs_row-is_reversed         = is_debit-is_reversed.
-    rs_row-is_reversing        = is_debit-is_reversing.
+
+    " FS #36 "Is Reversing": no directly-confirmed boolean field for "this
+    " document reverses another one". Derived here as "a ReverseDocument
+    " reference exists and this document itself was NOT the one reversed" -
+    " ASSUMPTION, direction of ReverseDocument needs confirming in ADT
+    " against real reversed/reversing document pairs.
+    rs_row-is_reversing        = COND #( WHEN is_debit-reverse_document IS NOT INITIAL
+                                            AND is_debit-is_reversed = abap_false
+                                          THEN abap_true ELSE abap_false ).
 
     " company_name / address / account_assignment are left blank here - the
     " FS's source fields for these are not part of I_GLAccountLineItem and
